@@ -1,81 +1,100 @@
 #!/bin/bash
-#
-# Compile script for kernel
-#
+
+# Ensure the script exits on error
+set -e
 
 SECONDS=0 # builtin bash timer
 
-# Allowed codenames
-ALLOWED_CODENAMES=("sweet" "tucana" "toco" "phoenix" "davinci")
+# Device configuration
+DEVICE="sweet"
+KERNEL_NAME="Oxygen"
 
-# Prompt user for device codename
-read -p "Enter device codename: " DEVICE
+TOOLCHAIN_PATH=$HOME/tc/bin
+GIT_COMMIT_ID=$(git rev-parse --short=8 HEAD)
 
-# Check if the entered codename is in the allowed list
-if [[ ! " ${ALLOWED_CODENAMES[@]} " =~ " ${DEVICE} " ]]; then
-    echo "Error: Invalid codename. Allowed codenames are: ${ALLOWED_CODENAMES[*]}"
+if [ ! -d $TOOLCHAIN_PATH ]; then
+    echo "TOOLCHAIN_PATH [$TOOLCHAIN_PATH] does not exist."
+    echo "Please ensure the toolchain is there, or change TOOLCHAIN_PATH in the script to your toolchain path."
     exit 1
 fi
 
-ZIPNAME="${DEVICE}-$(date '+%Y%m%d-%H%M').zip"
+echo "TOOLCHAIN_PATH: [$TOOLCHAIN_PATH]"
+export PATH="$TOOLCHAIN_PATH:$PATH"
 
-export ARCH=arm64
-export KBUILD_BUILD_USER=aryan
-export KBUILD_BUILD_HOST=celeste
-export PATH="/home/celeste/pixelos/prebuilts/clang/host/linux-x86/clang-r530567/bin/:$PATH"
+MAKE_ARGS="ARCH=arm64 O=out CC=clang LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_COMPAT=arm-linux-gnueabi- AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip"
 
+# Check clang is existing.
+echo "[clang --version]:"
+clang --version
+
+# Export variables
+export KBUILD_BUILD_USER="aryan"
+export KBUILD_BUILD_HOST="curiousnom"
+export KBUILD_LAST_COMMIT=${GIT_COMMIT_ID}
+
+# Clean option
 if [[ $1 = "-c" || $1 = "--clean" ]]; then
-	rm -rf out
-	echo "Cleaned output folder"
+    echo "Cleaning..."
+    rm -rf out/
+    rm -rf error.log
+    echo "Cleaned output folder"
 fi
 
-echo -e "\nStarting compilation for $DEVICE...\n"
-make O=out ARCH=arm64 ${DEVICE}_defconfig
-make -j$(nproc) \
-    O=out \
-    ARCH=arm64 \
-    LLVM=1 \
-    LLVM_IAS=1 \
-    CROSS_COMPILE=aarch64-linux-gnu- \
-    CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+echo "Cleaning old builds..."
+rm -rf error.log
+
+echo "Cloning AnyKernel3 for packing kernel..."
+if [ -d "AnyKernel3/.git" ]; then
+    echo "AnyKernel3 already cloned. Skipping."
+else
+    rm -rf AnyKernel3  # ensure clean state
+    if ! git clone -q --depth 1 https://github.com/CuriousNom/AnyKernel3.git -b sweet AnyKernel3; then
+        echo -e "\nAnyKernel3 repo not found locally and couldn't clone from GitHub! Aborting..."
+        exit 1
+    fi
+fi
+
+# ------------- Building for SWEET ---------------
+echo -e "\nStarting compilation for sweet...\n"
+
+make $MAKE_ARGS sweet_defconfig
+
+make $MAKE_ARGS -j$(nproc --all) 2> >(tee -a error.log >&2)
 
 kernel="out/arch/arm64/boot/Image.gz"
 dtbo="out/arch/arm64/boot/dtbo.img"
 dtb="out/arch/arm64/boot/dtb.img"
 
-if [ ! -f "$kernel" ] || [ ! -f "$dtbo" ] || [ ! -f "$dtb" ]; then
-	echo -e "\nCompilation failed!"
-	exit 1
+if [ ! -f "$kernel" ]; then
+    echo -e "\nThe file [$kernel] does not exist. Build failed."
+    exit 1
 fi
 
 echo -e "\nKernel compiled successfully! Zipping up...\n"
 
-if [ -d "$AK3_DIR" ]; then
-	cp -r $AK3_DIR AnyKernel3
-else
-	if ! git clone -q https://github.com/basamaryan/AnyKernel3 -b master AnyKernel3; then
-		echo -e "\nAnyKernel3 repo not found locally and couldn't clone from GitHub! Aborting..."
-		exit 1
-	fi
-fi
-
 # Modify anykernel.sh to replace device names
-sed -i "s/device\.name1=.*/device.name1=${DEVICE}/" AnyKernel3/anykernel.sh
-sed -i "s/device\.name2=.*/device.name2=${DEVICE}in/" AnyKernel3/anykernel.sh
+sed -i "s/device\.name1=.*/device.name1=sweet/" AnyKernel3/anykernel.sh
+sed -i "s/device\.name2=.*/device.name2=sweetin/" AnyKernel3/anykernel.sh
 
-cp $kernel AnyKernel3
-cp $dtbo AnyKernel3
-cp $dtb AnyKernel3
-cd AnyKernel3
-zip -r9 "../$ZIPNAME" * -x .git
-cd ..
-rm -rf AnyKernel3
-echo -e "\nCompleted in $((SECONDS / 60)) minute(s) and $((SECONDS % 60)) second(s) !"
-echo "Zip: $ZIPNAME"
+rm -rf AnyKernel3/kernels/
+mkdir -p AnyKernel3/kernels/
+cp $kernel AnyKernel3/kernels/
 
-if test -z "$(git rev-parse --show-cdup 2>/dev/null)" &&
-   head=$(git rev-parse --verify HEAD 2>/dev/null); then
-	HASH="$(echo $head | cut -c1-8)"
+# Copy dtbo and dtb if they exist
+if [ -f "$dtbo" ]; then
+    cp $dtbo AnyKernel3/kernels/
 fi
 
-telegram -f $ZIPNAME -M "Completed in $((SECONDS / 60)) minute(s) and $((SECONDS % 60)) second(s) ! Latest commit: $HASH"
+if [ -f "$dtb" ]; then
+    cp $dtb AnyKernel3/kernels/
+fi
+
+cd AnyKernel3
+ZIP_FILENAME="Kernel_Oxygen_sweet_anykernel3_${GIT_COMMIT_ID}.zip"
+zip -r9 $ZIP_FILENAME ./* -x .git .gitignore out/ ./*.zip
+mv $ZIP_FILENAME ../
+cd ..
+
+echo -e "\nBuild for sweet finished."
+echo -e "Completed in $((SECONDS / 60)) minute(s) and $((SECONDS % 60)) second(s) !"
+echo "Zip: $ZIP_FILENAME"
